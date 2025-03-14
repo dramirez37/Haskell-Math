@@ -32,6 +32,10 @@ module Statistics.GLM.IRLS
 ) where
 
 import Statistics.GLM.ExponentialFamily
+<<<<<<< HEAD
+=======
+import Statistics.GLM.ErrorHandling
+>>>>>>> 3738bbc (Prelimary Attempt)
 import qualified Numeric.LinearAlgebra as LA
 import Numeric.LinearAlgebra (Matrix, Vector, (#>), (<.>), (<#), fromList, toList, 
                              fromRows, toRows, diag, size, konst, atIndex)
@@ -152,6 +156,7 @@ coordinateDescentStep x z w lambda beta =
 irlsUpdate :: Vector Double -> Matrix Double -> Vector Double -> ExponentialFamily -> Link -> Double -> 
              (Vector Double, Double, Double)
 irlsUpdate beta x y family link lambda = 
+<<<<<<< HEAD
     let eta = linearPredictor x beta
         mu = fittedValues eta link
         z = workingResponses y mu eta link
@@ -184,11 +189,20 @@ irlsUpdate beta x y family link lambda =
 
 -- | Main function to fit a GLM using IRLS
 fitGLM :: Matrix Double -> Vector Double -> ExponentialFamily -> Link -> FitConfig -> IO FitResult
+=======
+    case safeirlsUpdate beta x y family link lambda of
+        Right result -> result
+        Left err -> error $ "IRLS update error: " ++ formatError err
+
+-- | Main function to fit a GLM using IRLS
+fitGLM :: Matrix Double -> Vector Double -> ExponentialFamily -> Link -> FitConfig -> IO (Either GLMError FitResult)
+>>>>>>> 3738bbc (Prelimary Attempt)
 fitGLM xRaw yRaw family link config = do
     -- Validate inputs
     let n = LA.rows xRaw
         p = LA.cols xRaw
         
+<<<<<<< HEAD
     when (n /= LA.size yRaw) $
         error $ "Design matrix has " ++ show n ++ " rows, but response vector has " 
                 ++ show (LA.size yRaw) ++ " elements"
@@ -277,3 +291,202 @@ fitGLM xRaw yRaw family link config = do
     
     -- Start the iteration
     iterate beta0 ll0 0 [] []
+=======
+    -- Check matrix/vector dimensions
+    if n /= LA.size yRaw
+    then return $ Left $ DimensionMismatchError $
+         dimensionErrorMsg "GLM fitting" [n, p] [LA.size yRaw, 1]
+    else do
+        -- Check response values
+        let validResponses = all (validateResponse family) (LA.toList yRaw)
+        if not validResponses
+        then return $ Left $ InvalidArgumentError $
+             printf "Response vector contains invalid values for %s family" (familyName family)
+        else do
+            -- Add intercept if requested
+            let x = if addIntercept config
+                    then LA.fromRows $ map (\row -> 1 LA.<| row) (LA.toRows xRaw)
+                    else xRaw
+                y = yRaw
+                
+            -- Initialize coefficients
+            let beta0 = initialCoefficients x y family link
+                mu0 = fittedValues (linearPredictor x beta0) link
+                ll0 = computeLogLikelihood y mu0 family link
+            
+            when (verbose config) $
+                putStrLn $ "Starting IRLS with initial log-likelihood: " ++ show ll0
+            
+            -- Iteratively update using IRLS
+            let 
+                iterate beta prevLL iter llHistory betaHistory
+                    | iter >= maxIterations config = 
+                        return $ Right $ FitResult 
+                                { coefficients = beta
+                                , convergenceInfo = ConvergenceInfo 
+                                    { iterations = iter
+                                    , converged = False
+                                    , finalLogLikelihood = prevLL
+                                    , logLikelihoodHistory = reverse (prevLL:llHistory)
+                                    , coefficientHistory = reverse (beta:betaHistory)
+                                    , finalDeltaNorm = 0.0
+                                    , message = "Maximum iterations reached without convergence"
+                                    }
+                                , family = family
+                                , link = link
+                                , designMatrix = x
+                                , responseVector = y
+                                , fittedValues = fittedValues (linearPredictor x beta) link
+                                , workingWeights = workingWeights (fittedValues (linearPredictor x beta) link) link family
+                                }
+                    | otherwise = do
+                        when (verbose config && iter `mod` 5 == 0) $
+                            putStrLn $ "Iteration " ++ show iter ++ ", Log-likelihood: " ++ show prevLL
+                        
+                        let (newBeta, newLL, deltaNorm) = irlsUpdate beta x y family link (lambdaLasso config)
+                            llChange = abs (newLL - prevLL)
+                            
+                        let newBetaHistory = beta : betaHistory
+                            newLLHistory = prevLL : llHistory
+                        
+                        if deltaNorm < tolerance config && llChange < llTolerance config
+                        then do
+                            when (verbose config) $ do
+                                putStrLn $ "Converged after " ++ show (iter + 1) ++ " iterations"
+                                putStrLn $ "Final log-likelihood: " ++ show newLL
+                                putStrLn $ "Coefficient change norm: " ++ show deltaNorm
+                            
+                            return $ Right $ FitResult 
+                                    { coefficients = newBeta
+                                    , convergenceInfo = ConvergenceInfo 
+                                        { iterations = iter + 1
+                                        , converged = True
+                                        , finalLogLikelihood = newLL
+                                        , logLikelihoodHistory = reverse (newLL:newLLHistory)
+                                        , coefficientHistory = reverse (newBeta:newBetaHistory)
+                                        , finalDeltaNorm = deltaNorm
+                                        , message = "Converged successfully"
+                                        }
+                                    , family = family
+                                    , link = link
+                                    , designMatrix = x
+                                    , responseVector = y
+                                    , fittedValues = fittedValues (linearPredictor x newBeta) link
+                                    , workingWeights = workingWeights (fittedValues (linearPredictor x newBeta) link) link family
+                                    }
+                        else
+                            iterate newBeta newLL (iter + 1) newLLHistory newBetaHistory
+            
+            -- Start the iteration
+            iterate beta0 ll0 0 [] []
+
+-- | Handle potential numerical issues in IRLS update
+-- Returns Either an error or the updated values
+safeirlsUpdate :: Vector Double -> Matrix Double -> Vector Double -> ExponentialFamily -> Link -> Double -> 
+                 Either GLMError (Vector Double, Double, Double)
+safeirlsUpdate beta x y family link lambda =
+    try $ do
+        let eta = linearPredictor x beta
+            mu = fittedValues eta link
+            
+        -- Check for numerical problems in fitted values
+        if any (not . isFinite) (LA.toList mu)
+        then Left $ GeneralNumericError "Non-finite values in fitted means"
+        else
+            let z = workingResponses y mu eta link
+                w = workingWeights mu link family
+                
+                -- Check for numerical problems in weights
+                cdItersMaybe = if any (not . isFinite) (LA.toList w) 
+                               then Left $ GeneralNumericError "Non-finite values in working weights"
+                               else Right 50 -- maximum CD iterations
+            in
+            cdItersMaybe >>= \maxCdIters -> 
+                let cdTol = 1e-8
+                    
+                    cdIteration beta' tol iter
+                        | iter >= maxCdIters = 
+                            if iter >= maxCdIters
+                            then Left $ ConvergenceError "Coordinate descent failed to converge"
+                            else Right beta'
+                        | otherwise = 
+                            let beta'' = coordinateDescentStep x z w lambda beta'
+                                delta = LA.norm_2 (LA.zipVectorWith (-) beta'' beta')
+                            in if delta < tol
+                               then Right beta''
+                               else cdIteration beta'' tol (iter + 1)
+                        
+                in cdIteration beta cdTol 0 >>= \betaNew ->
+                    let etaNew = linearPredictor x betaNew
+                        muNew = fittedValues etaNew link
+                        ll = computeLogLikelihood y muNew family link
+                        deltaNorm = LA.norm_2 (LA.zipVectorWith (-) betaNew beta)
+                    in Right (betaNew, ll, deltaNorm)
+  where
+    -- Helper to check for NaN or Infinity
+    isFinite x = not (isNaN x || isInfinite x)
+    
+    -- Try to evaluate an expression, catching numeric errors
+    try action = action
+    
+    -- | Simplified coordinateDescentStep for use in IRLS
+    coordinateDescentStep x z w lambda beta =
+        let p = LA.cols x
+            doCoordinate j beta' =
+                let xj = LA.takeColumn x j
+                    wXj = LA.zipVectorWith (*) w xj
+                    updatedBeta = LA.subVector 0 p beta'
+                    residual = LA.zipVectorWith (-) z (x LA.#> updatedBeta)
+                    wRj = LA.dotVector wXj residual + (LA.dotVector wXj xj) * (beta' `atIndex` j)
+                    denom = LA.dotVector wXj xj
+                    coef = if denom > 1e-10 then wRj / denom else 0
+                in LA.accum beta' [(j, softThreshold lambda coef)]
+        in foldl (\b j -> doCoordinate j b) beta [0..(p-1)]
+        
+    -- | Soft-thresholding operator for L1 regularization
+    softThreshold lambda x
+      | x > lambda = x - lambda
+      | x < (-lambda) = x + lambda
+      | otherwise = 0.0
+
+-- | Helper functions that might have been defined elsewhere in the original file
+linearPredictor :: Matrix Double -> Vector Double -> Vector Double
+linearPredictor x beta = x LA.#> beta
+
+fittedValues :: Vector Double -> Link -> Vector Double
+fittedValues eta link = LA.cmap (linkInverse link) eta
+
+workingResponses :: Vector Double -> Vector Double -> Vector Double -> Link -> Vector Double
+workingResponses y mu eta link = 
+    let deriv = LA.cmap (linkDerivative link) mu
+        adjustment = LA.zipVectorWith (*) deriv (LA.zipVectorWith (-) y mu)
+    in LA.zipVectorWith (+) eta adjustment
+
+workingWeights :: Vector Double -> Link -> ExponentialFamily -> Vector Double
+workingWeights mu link family =
+    let deriv = LA.cmap (linkDerivative link) mu
+        variance = LA.cmap (cumulantSecondDerivative family) (LA.cmap (linkFunction link) mu)
+        denominators = LA.zipVectorWith (*) (LA.cmap (^2) deriv) variance
+    in LA.cmap (\x -> if x > 1e-10 then 1/x else 1e10) denominators
+
+computeLogLikelihood :: Vector Double -> Vector Double -> ExponentialFamily -> Link -> Double
+computeLogLikelihood y mu family _ =
+    let theta = LA.cmap (linkFunction (canonicalLink family)) mu
+        logLiks = LA.zipVectorWith (logLikelihood family) y theta
+    in LA.sumElements logLiks
+
+initialCoefficients :: Matrix Double -> Vector Double -> ExponentialFamily -> Link -> Vector Double
+initialCoefficients x y family link
+  | familyName family == "Gaussian" = 
+      let (q, r) = LA.qr x
+          qty = LA.tr q LA.#> y
+      in LA.fromList $ LA.toList $ LA.backSub r qty
+  | otherwise = LA.konst 0 (LA.cols x)
+
+-- | Helper function for checking NaN/Infinity values
+isNaN :: Double -> Bool
+isNaN x = x /= x
+
+isInfinite :: Double -> Bool
+isInfinite x = x == 1/0 || x == (-1/0)
+>>>>>>> 3738bbc (Prelimary Attempt)
